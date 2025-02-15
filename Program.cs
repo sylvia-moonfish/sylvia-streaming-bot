@@ -3,119 +3,201 @@ using Discord.Interactions;
 using Discord.WebSocket;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using sylvia_streaming_bot;
+using SpotifyAPI.Web;
+using SpotifyAPI.Web.Auth;
 
-public class Program
+namespace sylvia_streaming_bot
 {
-    private static DiscordSocketClient? _client;
-    private static InteractionService? _interactionService;
-    private static IServiceProvider? _serviceProvider;
-    private static IConfiguration? _config;
-
-    public static async Task Main()
+    public class Program
     {
-        // Initialize configuration
-        _config = Configuration.GetConfig();
+        #region Global Static
+        private static IConfiguration? _config;
+        private static IServiceProvider? _serviceProvider;
+        #endregion
 
-        // Get token using different fallback methods
-        string? token = GetDiscordToken();
-        if (string.IsNullOrEmpty(token))
-            throw new InvalidOperationException(
-                "Discord token not found. Please set it in configuration file."
+        #region Discord Static
+        private static string? _discordToken;
+        #endregion
+
+        #region Spotify Static
+        private static string? _spotifyClientId;
+        private static string? _spotifyClientSecret;
+        private static EmbedIOAuthServer? _server;
+        #endregion
+
+        public static async Task Main()
+        {
+            _config = Configuration.GetConfig();
+            if (_config == null)
+                throw new Exception("Failed to initialize config.");
+
+            _discordToken = _config["Discord:BotToken"];
+            if (string.IsNullOrWhiteSpace(_discordToken))
+                throw new Exception("Discord token is empty.");
+
+            _spotifyClientId = _config["Spotify:ClientId"];
+            if (string.IsNullOrWhiteSpace(_spotifyClientId))
+                throw new Exception("Spotify client id is empty.");
+
+            _spotifyClientSecret = _config["Spotify:ClientSecret"];
+            if (string.IsNullOrWhiteSpace(_spotifyClientSecret))
+                throw new Exception("Spotify client secret is empty.");
+
+            _server = new EmbedIOAuthServer(new Uri("http://localhost:5543/callback"), 5543);
+            await _server.Start();
+
+            _server.AuthorizationCodeReceived += AuthorizationCodeReceived;
+            _server.ErrorReceived += ErrorReceived;
+
+            LoginRequest loginRequest = new LoginRequest(
+                _server.BaseUri,
+                _spotifyClientId,
+                LoginRequest.ResponseType.Code
+            )
+            {
+                Scope = [Scopes.UserModifyPlaybackState, Scopes.UserReadPlaybackState],
+            };
+
+            BrowserUtil.Open(loginRequest.ToUri());
+
+            await Task.Delay(-1);
+        }
+
+        #region Spotify Event Handlers
+        private static async Task AuthorizationCodeReceived(
+            object sender,
+            AuthorizationCodeResponse response
+        )
+        {
+            if (
+                _server == null
+                || string.IsNullOrWhiteSpace(_spotifyClientId)
+                || string.IsNullOrWhiteSpace(_spotifyClientSecret)
+            )
+                return;
+
+            await _server.Stop();
+
+            SpotifyClientConfig spotifyClientConfig = SpotifyClientConfig.CreateDefault();
+            AuthorizationCodeTokenResponse tokenResponse = await new OAuthClient(
+                spotifyClientConfig
+            ).RequestToken(
+                new AuthorizationCodeTokenRequest(
+                    _spotifyClientId,
+                    _spotifyClientSecret,
+                    response.Code,
+                    new Uri("http://localhost:5543/callback")
+                )
             );
 
-        // Setup dependency injection
-        _serviceProvider = ConfigureServices();
+            await SetUpServices(new SpotifyClient(tokenResponse.AccessToken));
+        }
 
-        if (_serviceProvider == null)
-            throw new InvalidOperationException();
-
-        _client = _serviceProvider.GetRequiredService<DiscordSocketClient>();
-        _interactionService = _serviceProvider.GetRequiredService<InteractionService>();
-
-        // Setup event handlers
-        _client.Ready += Client_Ready;
-        _client.Log += LogAsync;
-        _interactionService.Log += LogAsync;
-
-        // Register command handlers
-        await _interactionService.AddModuleAsync<CommandModule>(_serviceProvider);
-
-        // Start the client
-        await _client.LoginAsync(TokenType.Bot, token);
-        await _client.StartAsync();
-
-        // Handle slash commands
-        _client.InteractionCreated += async (interaction) =>
+        private static async Task ErrorReceived(object sender, string error, string? state)
         {
-            var ctx = new SocketInteractionContext(_client, interaction);
-            await _interactionService.ExecuteCommandAsync(ctx, _serviceProvider);
-        };
+            Console.WriteLine("Spotify authorization error: " + error.ToString());
 
-        await Task.Delay(-1);
-    }
+            if (_server != null)
+                await _server.Stop();
+        }
+        #endregion
 
-    private static string? GetDiscordToken()
-    {
-        if (_config == null)
-            return null;
+        #region Service Set Up
+        private static async Task SetUpServices(SpotifyClient spotifyClient)
+        {
+            if (_config == null || string.IsNullOrWhiteSpace(_discordToken))
+                return;
 
-        return _config["Discord:BotToken"];
-    }
-
-    private static IServiceProvider? ConfigureServices()
-    {
-        if (_config == null)
-            return null;
-
-        return new ServiceCollection()
-            .AddSingleton(_config)
-            .AddSingleton(
-                new DiscordSocketClient(
-                    new DiscordSocketConfig
-                    {
-                        GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates,
-                    }
+            _serviceProvider = new ServiceCollection()
+                .AddSingleton(_config)
+                .AddSingleton(spotifyClient)
+                .AddSingleton(
+                    new DiscordSocketClient(
+                        new DiscordSocketConfig
+                        {
+                            GatewayIntents =
+                                GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates,
+                            UseInteractionSnowflakeDate = false,
+                        }
+                    )
                 )
-            )
-            .AddSingleton(x => new InteractionService(x.GetRequiredService<DiscordSocketClient>()))
-            .BuildServiceProvider();
-    }
+                .AddSingleton(sp => new InteractionService(
+                    sp.GetRequiredService<DiscordSocketClient>()
+                ))
+                .BuildServiceProvider();
 
-    private static async Task Client_Ready()
-    {
-        if (_config == null || _interactionService == null)
-            return;
+            DiscordSocketClient discordClient =
+                _serviceProvider.GetRequiredService<DiscordSocketClient>();
+            InteractionService interactionService =
+                _serviceProvider.GetRequiredService<InteractionService>();
 
-        // Register slash commands with Discord
-        if (IsDebug())
-        {
-            // Register commands to a specific test guild in debug mode
-            var testGuildId = _config.GetValue<ulong>("Discord:TestGuildId");
-            await _interactionService.RegisterCommandsToGuildAsync(testGuildId);
+            discordClient.Ready += Ready;
+            discordClient.InteractionCreated += InteractionCreated;
+            discordClient.Log += Log;
+            interactionService.Log += Log;
+
+            await interactionService.AddModuleAsync<CommandModule>(_serviceProvider);
+
+            await discordClient.LoginAsync(TokenType.Bot, _discordToken);
+            await discordClient.StartAsync();
         }
-        else
+        #endregion
+
+        #region Discord Event Handlers
+        private static async Task Ready()
         {
-            // Register commands globally in production
-            await _interactionService.RegisterCommandsGloballyAsync();
+            if (_config == null || _serviceProvider == null)
+                return;
+
+            InteractionService interactionService =
+                _serviceProvider.GetRequiredService<InteractionService>();
+
+            if (IsDebug())
+            {
+                ulong testGuildId = _config.GetValue<ulong>("Discord:TestGuildId");
+                await interactionService.RegisterCommandsToGuildAsync(testGuildId);
+            }
+            else
+            {
+                await interactionService.RegisterCommandsGloballyAsync();
+            }
+
+            Console.WriteLine("Commands registered.");
         }
 
-        Console.WriteLine("Bot is ready!");
-    }
+        private static async Task InteractionCreated(SocketInteraction interaction)
+        {
+            if (_serviceProvider == null)
+                return;
 
-    private static bool IsDebug()
-    {
+            DiscordSocketClient discordClient =
+                _serviceProvider.GetRequiredService<DiscordSocketClient>();
+            InteractionService interactionService =
+                _serviceProvider.GetRequiredService<InteractionService>();
+
+            SocketInteractionContext context = new SocketInteractionContext(
+                discordClient,
+                interaction
+            );
+
+            await interactionService.ExecuteCommandAsync(context, _serviceProvider);
+        }
+
+        private static Task Log(LogMessage log)
+        {
+            Console.WriteLine(log.ToString());
+
+            return Task.CompletedTask;
+        }
+
+        private static bool IsDebug()
+        {
 #if DEBUG
-        return true;
+            return true;
 #else
-        return false;
+            return false;
 #endif
-    }
-
-    private static Task LogAsync(LogMessage log)
-    {
-        Console.WriteLine(log.ToString());
-
-        return Task.CompletedTask;
+        }
+        #endregion
     }
 }

@@ -1,306 +1,290 @@
 ﻿using System.Diagnostics;
+using Discord;
 using Discord.Audio;
 using Discord.Interactions;
 using Discord.WebSocket;
-using Microsoft.Extensions.Configuration;
 using NAudio.CoreAudioApi;
-using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
+using SpotifyAPI.Web;
 
 namespace sylvia_streaming_bot
 {
     public class CommandModule : InteractionModuleBase<SocketInteractionContext>
     {
-        private readonly DiscordSocketClient _client;
+        private readonly DiscordSocketClient _discordClient;
+        private readonly SpotifyClient _spotifyClient;
 
-        private MMDevice? _device;
-        private AudioSessionControl? _targetSession;
-        private WasapiLoopbackCapture? _capture;
-
-        private SocketVoiceChannel? _voiceChannel;
-        private Discord.Audio.IAudioClient? _audioClient;
-        private AudioOutStream? _audioStream;
-
-        private Task _updateStatusTask;
-
-        private const int DISCORD_SAMPLE_RATE = 48000;
-
-        public CommandModule(DiscordSocketClient client)
+        public CommandModule(DiscordSocketClient discordClient, SpotifyClient spotifyClient)
         {
-            _client = client;
+            _discordClient = discordClient;
+            _spotifyClient = spotifyClient;
 
-            _updateStatusTask = Task.Factory.StartNew(
-                async () =>
+            lock (Singletons.Lock)
+            {
+                if (Singletons.UpdateStatusTask == null)
                 {
-                    while (true)
-                    {
-                        try
+                    Singletons.UpdateStatusTask = new Task(
+                        async () =>
                         {
-                            if (_voiceChannel != null)
+                            while (true)
                             {
-                                Process[] processes = Process.GetProcessesByName("Spotify");
-
-                                foreach (Process p in processes)
+                                try
                                 {
-                                    string title = p.MainWindowTitle.Trim();
+                                    if (Singletons.VoiceChannel == null)
+                                        continue;
 
-                                    if (
-                                        !string.IsNullOrEmpty(title)
-                                        && title != _voiceChannel.Status
-                                    )
+                                    string currentStatus = Singletons.VoiceChannel.Status;
+
+                                    if (Singletons.IsPlayingSpotify)
                                     {
-                                        await _voiceChannel.SetStatusAsync(":microphone: " + title);
+                                        Process[] processes = Process.GetProcessesByName("Spotify");
+
+                                        foreach (Process p in processes)
+                                        {
+                                            string title = p.MainWindowTitle.Trim();
+
+                                            if (
+                                                !string.IsNullOrWhiteSpace(title)
+                                                && title != currentStatus
+                                            )
+                                            {
+                                                await Singletons.VoiceChannel.SetStatusAsync(
+                                                    ":microphone: " + title
+                                                );
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
+                                catch { }
+                                finally
+                                {
+                                    Thread.Sleep(5000);
+                                }
                             }
-                        }
-                        catch { }
-                        finally
-                        {
-                            Thread.Sleep(5000);
-                        }
-                    }
-                },
-                new CancellationTokenSource().Token,
-                TaskCreationOptions.LongRunning,
-                TaskScheduler.Default
-            );
+                        },
+                        TaskCreationOptions.LongRunning
+                    );
+                    Singletons.UpdateStatusTask.Start();
+                }
+            }
         }
 
-        [SlashCommand("시작", "스트리밍 시작")]
-        public async Task StartStream()
+        #region Discord Commands
+        [SlashCommand("소환", "현재 채널에 소환.", false, RunMode.Async)]
+        public async Task Summon()
         {
             await DeferAsync();
 
-            if (_capture != null && _capture.CaptureState != CaptureState.Stopped)
-            {
-                _capture.RecordingStopped -= RecordingStopped;
-                _capture.StopRecording();
-                _capture.Dispose();
-                _capture = null;
-            }
+            StopSpotifyCapture();
+            await PauseSpotify();
+            DisconnectFromChannel();
 
-            _targetSession = null;
-
-            if (_device != null)
-            {
-                _device.Dispose();
-                _device = null;
-            }
-
-            if (_audioStream != null)
-            {
-                await _audioStream.DisposeAsync();
-                _audioStream = null;
-            }
-
-            if (_audioClient != null)
-            {
-                await _audioClient.StopAsync();
-                _audioClient.Dispose();
-                _audioClient = null;
-            }
-
-            if (_voiceChannel != null)
-            {
-                await _voiceChannel.DisconnectAsync();
-                _voiceChannel = null;
-            }
+            Thread.Sleep(1000);
 
             try
             {
                 SocketGuildUser? user = Context.User as SocketGuildUser;
-
                 if (user == null)
                     throw new Exception("User is null.");
 
-                IConfiguration? config = Configuration.GetConfig();
-
-                if (config == null)
-                    throw new Exception("No config.");
-
-                string? adminId = config["Discord:AdminId"];
-
-                if (adminId == null)
-                    throw new Exception("No admin id.");
-
-                if (user.Id.ToString() != adminId)
+                if (user.VoiceState == null || user.VoiceChannel == null)
                 {
-                    await FollowupAsync("당신은 실비아가 아니네요!");
+                    await FollowupAsync("음성 채널에 있어야 소환할 수 있습니다.");
                     return;
                 }
-
-                if (user.VoiceState == null)
-                {
-                    await FollowupAsync("음성 채널에 있지 않네요!");
-                    return;
-                }
-
-                _voiceChannel = user.VoiceChannel;
 
                 await FollowupAsync(
-                    "연결됨: " + user.DisplayName + ", 채널: " + _voiceChannel.Name
+                    $"소환을 시도합니다. 소환자: {user.DisplayName}, 소환 채널: {user.VoiceChannel.Name}"
                 );
 
-                _audioClient = await _voiceChannel.ConnectAsync();
-                await _audioClient.SetSpeakingAsync(true);
+                await ConnectToChannel(user.VoiceChannel);
+                await PlaySpotify();
+                StartSpotifyCapture();
 
-                _audioStream = _audioClient.CreatePCMStream(AudioApplication.Mixed);
-
-                MMDeviceEnumerator deviceEnumerator = new MMDeviceEnumerator();
-                _device = deviceEnumerator.GetDefaultAudioEndpoint(
-                    DataFlow.Render,
-                    Role.Multimedia
+                await FollowupAsync(
+                    "실포티파이, 소환에 응해 이곳에 왔다. 묻겠다, 그대가 나의 마스터인가."
                 );
-
-                AudioSessionManager sessionManager = _device.AudioSessionManager;
-
-                for (int i = 0; i < sessionManager.Sessions.Count; i++)
-                {
-                    AudioSessionControl session = sessionManager.Sessions[i];
-
-                    try
-                    {
-                        Process p = Process.GetProcessById((int)session.GetProcessID);
-
-                        if (p.ProcessName == "Spotify")
-                            _targetSession = session;
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-                }
-
-                if (_targetSession == null)
-                    throw new InvalidOperationException("Not able to capture Spotify.");
-
-                _capture = new WasapiLoopbackCapture(_device);
-                _capture.ShareMode = AudioClientShareMode.Shared;
-                _capture.DataAvailable += DataAvailable;
-                _capture.RecordingStopped += RecordingStopped;
-
-                _capture.StartRecording();
-
-                await FollowupAsync("시작되었습니다.");
             }
             catch (Exception e)
             {
-                Console.WriteLine("Error: " + e.ToString());
-                await FollowupAsync("작업 중 오류 발생!");
+                Console.WriteLine("Error during Summon: " + e.ToString());
+                await FollowupAsync("소환 실패.");
             }
         }
 
-        private byte[] ToPCM16(byte[] inputBuffer, int length, WaveFormat format)
+        [SlashCommand("소환해제", "소환 해제.", false, RunMode.Async)]
+        public async Task Unsummon()
+        {
+            await DeferAsync();
+
+            StopSpotifyCapture();
+            await PauseSpotify();
+            DisconnectFromChannel();
+
+            await FollowupAsync("소환 해제 완료.");
+        }
+        #endregion
+
+        #region Spotify Capture Functions
+        private void StartSpotifyCapture()
+        {
+            lock (Singletons.Lock)
+            {
+                MMDeviceEnumerator deviceEnumerator = new MMDeviceEnumerator();
+                Singletons.Device = deviceEnumerator.GetDefaultAudioEndpoint(
+                    DataFlow.Render,
+                    Role.Multimedia
+                );
+                Singletons.Capture = new WasapiLoopbackCapture(Singletons.Device)
+                {
+                    ShareMode = AudioClientShareMode.Shared,
+                };
+                Singletons.Capture.DataAvailable += DataAvailable;
+                Singletons.Capture.StartRecording();
+                Singletons.IsPlayingSpotify = true;
+            }
+        }
+
+        private void StopSpotifyCapture()
+        {
+            lock (Singletons.Lock)
+            {
+                Singletons.IsPlayingSpotify = false;
+
+                if (Singletons.Capture != null)
+                {
+                    Singletons.Capture.StopRecording();
+                    Singletons.Capture.Dispose();
+                    Singletons.Capture = null;
+                }
+
+                if (Singletons.Device != null)
+                {
+                    Singletons.Device.Dispose();
+                    Singletons.Device = null;
+                }
+            }
+        }
+
+        private void DataAvailable(object? s, WaveInEventArgs args)
+        {
+            try
+            {
+                lock (Singletons.Lock)
+                {
+                    if (
+                        Singletons.AudioClient == null
+                        || Singletons.AudioStream == null
+                        || Singletons.Capture == null
+                    )
+                        return;
+
+                    byte[] pcm16 = ToPcm16(
+                        args.Buffer,
+                        args.BytesRecorded,
+                        Singletons.Capture.WaveFormat
+                    );
+                    Singletons.AudioStream.Write(pcm16);
+                }
+            }
+            catch { }
+        }
+
+        private byte[] ToPcm16(byte[] inputBuffer, int length, WaveFormat format)
         {
             if (length == 0)
                 return Array.Empty<byte>();
 
             using MemoryStream memStream = new MemoryStream(inputBuffer, 0, length);
             using RawSourceWaveStream inputStream = new RawSourceWaveStream(memStream, format);
-
             SampleToWaveProvider16 waveProvider = new SampleToWaveProvider16(
-                new WdlResamplingSampleProvider(
-                    new WaveToSampleProvider(inputStream),
-                    DISCORD_SAMPLE_RATE
-                )
+                new WdlResamplingSampleProvider(new WaveToSampleProvider(inputStream), 48000)
             );
 
-            byte[] convertedBuffer = new byte[length];
-
+            byte[] outBuffer = new byte[length];
             using MemoryStream outStream = new MemoryStream();
             int read;
 
-            while ((read = waveProvider.Read(convertedBuffer, 0, length)) > 0)
-            {
-                outStream.Write(convertedBuffer, 0, read);
-            }
+            while ((read = waveProvider.Read(outBuffer, 0, length)) > 0)
+                outStream.Write(outBuffer, 0, read);
 
             return outStream.ToArray();
         }
+        #endregion
 
-        private async void DataAvailable(object? s, WaveInEventArgs waveArgs)
+        #region Discord Connection Functions
+        private async Task ConnectToChannel(SocketVoiceChannel voiceChannel)
         {
+            IAudioClient? audioClient = null;
+
             try
             {
-                if (
-                    _audioClient != null
-                    && _audioStream != null
-                    && _targetSession != null
-                    && _capture != null
-                    && !_targetSession.IsSystemSoundsSession
-                    && _targetSession.State == AudioSessionState.AudioSessionStateActive
-                )
-                {
-                    byte[] pcm16 = ToPCM16(
-                        waveArgs.Buffer,
-                        waveArgs.BytesRecorded,
-                        _capture.WaveFormat
-                    );
-
-                    await _audioStream.WriteAsync(pcm16);
-                    await _audioStream.FlushAsync();
-                }
+                audioClient = await voiceChannel.ConnectAsync();
             }
-            catch (Exception e)
-            {
-                Console.WriteLine("Error streaming audio: " + e.ToString());
+            catch { }
 
-                if (_capture != null)
-                {
-                    _capture.StopRecording();
-                }
+            if (audioClient == null)
+                return;
+
+            lock (Singletons.Lock)
+            {
+                Singletons.VoiceChannel = voiceChannel;
+                Singletons.AudioClient = audioClient;
+                Singletons.AudioStream = audioClient.CreatePCMStream(AudioApplication.Music);
             }
         }
 
-        private async void RecordingStopped(object? s, StoppedEventArgs stopArgs)
+        private void DisconnectFromChannel()
         {
-            if (_audioStream != null)
+            lock (Singletons.Lock)
             {
-                await _audioStream.DisposeAsync();
-                _audioStream = null;
+                if (Singletons.AudioStream != null)
+                {
+                    Singletons.AudioStream.DisposeAsync();
+                    Singletons.AudioStream = null;
+                }
+
+                if (Singletons.AudioClient != null)
+                {
+                    Singletons.AudioClient.Dispose();
+                    Singletons.AudioClient = null;
+                }
+
+                if (Singletons.VoiceChannel != null)
+                {
+                    Singletons.VoiceChannel.DisconnectAsync();
+                    Singletons.VoiceChannel = null;
+                }
             }
+        }
+        #endregion
 
-            if (_audioClient != null)
-            {
-                await _audioClient.StopAsync();
-                _audioClient.Dispose();
-                _audioClient = null;
-            }
-
-            ulong voiceChannelId = 0;
-
-            if (_voiceChannel != null)
-            {
-                voiceChannelId = _voiceChannel.Id;
-
-                await _voiceChannel.DisconnectAsync();
-                _voiceChannel = null;
-            }
-
-            if (voiceChannelId == 0)
+        #region Spotify Web API
+        private async Task PlaySpotify()
+        {
+            if (_spotifyClient == null)
                 return;
 
             try
             {
-                _voiceChannel = await _client.GetChannelAsync(voiceChannelId) as SocketVoiceChannel;
-
-                if (_voiceChannel == null)
-                    throw new Exception("Voice channel is null.");
-
-                _audioClient = await _voiceChannel.ConnectAsync();
-                await _audioClient.SetSpeakingAsync(true);
-
-                _audioStream = _audioClient.CreatePCMStream(AudioApplication.Mixed);
-
-                if (_capture != null)
-                    _capture.StartRecording();
+                await _spotifyClient.Player.ResumePlayback();
             }
-            catch (Exception e)
-            {
-                Console.WriteLine("Error while restarting: " + e.ToString());
-            }
+            catch { }
         }
+
+        private async Task PauseSpotify()
+        {
+            if (_spotifyClient == null)
+                return;
+
+            try
+            {
+                await _spotifyClient.Player.PausePlayback();
+            }
+            catch { }
+        }
+        #endregion
     }
 }
